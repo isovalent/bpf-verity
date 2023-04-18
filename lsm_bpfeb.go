@@ -12,6 +12,8 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type lsmDigest struct{ Value [32]uint8 }
+
 // loadLsm returns the embedded CollectionSpec for lsm.
 func loadLsm() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_LsmBytes)
@@ -60,6 +62,7 @@ type lsmProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type lsmMapSpecs struct {
+	Allowed *ebpf.MapSpec `ebpf:"allowed"`
 }
 
 // lsmObjects contains all objects after they have been loaded into the kernel.
@@ -81,10 +84,13 @@ func (o *lsmObjects) Close() error {
 //
 // It can be passed to loadLsmObjects or ebpf.CollectionSpec.LoadAndAssign.
 type lsmMaps struct {
+	Allowed *ebpf.Map `ebpf:"allowed"`
 }
 
 func (m *lsmMaps) Close() error {
-	return _LsmClose()
+	return _LsmClose(
+		m.Allowed,
+	)
 }
 
 // lsmPrograms contains all programs after they have been loaded into the kernel.

@@ -4,6 +4,8 @@
 *.dll
 *.so
 *.dylib
+bpf-verity
+tcprtt
 
 # Test binary, built with `go test -c`
 *.test
