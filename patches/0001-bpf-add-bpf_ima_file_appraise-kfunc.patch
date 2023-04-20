@@ -1,0 +1,128 @@
+From 5156d745aacd10cdd2842c5a69f0abda46b32044 Mon Sep 17 00:00:00 2001
+From: Lorenz Bauer <lmb@isovalent.com>
+Date: Thu, 20 Apr 2023 12:19:13 +0200
+Subject: [PATCH] bpf: add bpf_ima_file_appraise kfunc
+
+Make ima_appraise_measurement available from BPF LSM programs.
+
+Signed-off-by: Lorenz Bauer <lmb@isovalent.com>
+---
+ fs/file_table.c      |  3 ++-
+ kernel/bpf/bpf_lsm.c | 55 ++++++++++++++++++++++++++++++++++++++++++++
+ kernel/fork.c        |  2 +-
+ 3 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 372653b92617..72f6ddbe4361 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -29,6 +29,7 @@
+ #include <linux/ima.h>
+ #include <linux/swap.h>
+ #include <linux/kmemleak.h>
++#include <linux/btf.h>
+ 
+ #include <linux/atomic.h>
+ 
+@@ -367,7 +368,7 @@ EXPORT_SYMBOL_GPL(flush_delayed_fput);
+ 
+ static DECLARE_DELAYED_WORK(delayed_fput_work, delayed_fput);
+ 
+-void fput(struct file *file)
++__bpf_kfunc void fput(struct file *file)
+ {
+ 	if (atomic_long_dec_and_test(&file->f_count)) {
+ 		struct task_struct *task = current;
+diff --git a/kernel/bpf/bpf_lsm.c b/kernel/bpf/bpf_lsm.c
+index e14c822f8911..02351bc6fa00 100644
+--- a/kernel/bpf/bpf_lsm.c
++++ b/kernel/bpf/bpf_lsm.c
+@@ -18,6 +18,8 @@
+ #include <linux/ima.h>
+ #include <linux/bpf-cgroup.h>
+ 
++#include "../../security/integrity/ima/ima.h"
++
+ /* For every LSM hook that allows attachment of BPF programs, declare a nop
+  * function where a BPF program can be attached.
+  */
+@@ -178,6 +180,42 @@ static const struct bpf_func_proto bpf_ima_file_hash_proto = {
+ 	.allowed	= bpf_ima_inode_hash_allowed,
+ };
+ 
++__diag_push();
++__diag_ignore_all("-Wmissing-prototypes",
++			"Global kfuncs as their definitions will be in BTF");
++
++__bpf_kfunc int bpf_ima_file_appraise(struct file *file)
++{
++	struct evm_ima_xattr_data *xattr_value = NULL;
++	struct integrity_iint_cache *iint = NULL;
++	struct inode *inode = file_inode(file);
++	int xattr_len, ret = -ENOENT;
++	char filename[NAME_MAX];
++	const char *pathname;
++	char *pathbuf = NULL;
++
++	pathname = ima_d_path(&file->f_path, &pathbuf, filename);
++
++	inode_lock(inode);
++
++	iint = integrity_iint_find(inode);
++	if (!iint)
++		goto unlock;
++
++	xattr_len = ima_read_xattr(file_dentry(file), &xattr_value, xattr_len);
++	ret = ima_appraise_measurement(NONE, iint, file, pathname, xattr_value,
++				       xattr_len, NULL);
++
++unlock:
++	inode_unlock(inode);
++
++	if (pathbuf)
++		__putname(pathbuf);
++	return ret;
++}
++
++__diag_pop();
++
+ BPF_CALL_1(bpf_get_attach_cookie, void *, ctx)
+ {
+ 	struct bpf_trace_run_ctx *run_ctx;
+@@ -374,3 +412,20 @@ const struct bpf_verifier_ops lsm_verifier_ops = {
+ 	.get_func_proto = bpf_lsm_func_proto,
+ 	.is_valid_access = btf_ctx_access,
+ };
++
++BTF_SET8_START(bpf_lsm_set)
++BTF_ID_FLAGS(func, get_task_exe_file, KF_ACQUIRE | KF_RET_NULL)
++BTF_ID_FLAGS(func, fput, KF_RELEASE)
++BTF_ID_FLAGS(func, bpf_ima_file_appraise, KF_TRUSTED_ARGS|KF_SLEEPABLE)
++BTF_SET8_END(bpf_lsm_set)
++
++static const struct btf_kfunc_id_set bpf_lsm_kfunc_set = {
++	.owner = THIS_MODULE,
++	.set   = &bpf_lsm_set,
++};
++
++static int init_subsystem(void)
++{
++	return register_btf_kfunc_id_set(BPF_PROG_TYPE_LSM, &bpf_lsm_kfunc_set);
++}
++late_initcall(init_subsystem);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index f68954d05e89..e7356b28f945 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1370,7 +1370,7 @@ struct file *get_mm_exe_file(struct mm_struct *mm)
+  * this is a kernel thread with borrowed mm (see the comment above get_task_mm).
+  * User must release file via fput().
+  */
+-struct file *get_task_exe_file(struct task_struct *task)
++__bpf_kfunc struct file *get_task_exe_file(struct task_struct *task)
+ {
+ 	struct file *exe_file = NULL;
+ 	struct mm_struct *mm;
+-- 
+2.40.0
+

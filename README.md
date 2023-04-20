@@ -1,79 +1,55 @@
 bpf-verity
 ===
 
-A proof-of-concept gatekeeper for `bpf()` syscalls based on [fs-verity] and [BPF LSM][lsm].
+A proof-of-concept gatekeeper for `bpf()` syscalls based on [fs-verity], [IMA] and [BPF LSM][lsm].
 
-`fs-verity` provides file integrity and measurement. A custom LSM hook written
-in BPF denies access to any binary that doesn't have an allow listed verity digest.
+* `fs-verity` provides simple and fast file integrity. Only data that is actually
+  accesses has to be verified.
+* `IMA` has tooling to handle keychains and supports signing `fs-verity` digests.
+  There is a way to attach signatures to files via xattr and verification outcomes
+  (appraisals) are cached.
+* `BPF LSM` is used to write a custom hook which only allows executables with a
+  valid IMA signature to access the `bpf()` syscall.
 
 # Requirements
 
-* A recent kernel, tested on `6.2.10-200.fc37.x86_64`
-* `CONFIG_FS_VERITY=y`
-* `fsverity` binary
+* [`virtme`](https://github.com/arighi/virtme)
 * Go toolchain
-* `sudo`
+* `fsverity` binary
+* `evmctl` with support for [`--veritysig`](https://sourceforge.net/p/linux-ima/ima-evm-utils/ci/fc46af121ef090241606a97c0e1c96897d723365/) in `/usr/local/bin`
+* A custom kernel with `patches/` applied. Use `virtme-configkernel --defconfig --custom /path/to/bpf-verity/kconfig` to configure.
 
 # Running the PoC
 
-The `run.sh` script compiles `bpf-verity` and an example binary, and then sets
-things up so that only the example is granted access to `bpf()`.
+`build.sh` compiles the necessary binary. Afterwards invoke `run.sh` using `virtme-run`:
 
 ```
-$ ./run.sh
-+ export CGO_ENABLED=0
-+ CGO_ENABLED=0
-+ rm -f tcprtt
-+ rm -f bpf-verity
-+ go build -o . github.com/cilium/ebpf/examples/tcprtt
-+ fsverity enable tcprtt
-+ go generate
-Compiled /home/lorenz/dev/bpf-verity/lsm_bpfel.o
-Stripped /home/lorenz/dev/bpf-verity/lsm_bpfel.o
-Wrote /home/lorenz/dev/bpf-verity/lsm_bpfel.go
-Compiled /home/lorenz/dev/bpf-verity/lsm_bpfeb.o
-Stripped /home/lorenz/dev/bpf-verity/lsm_bpfeb.o
-Wrote /home/lorenz/dev/bpf-verity/lsm_bpfeb.go
-+ go build .
-+ fsverity enable bpf-verity
-+ exec sudo ./bpf-verity ./tcprtt
-Allowing verity digest of "./bpf-verity" (83524cd005a235183200cecca20210bda9608d0daa37779eda3ce29181d99d5a)
-Allowing verity digest of "./tcprtt" (cf3fd9d5b31a30c28e0c0b7c3b190e98e9a25ac8f1ae075e5e08542e09a357b9)
+$ virtme-run --pwd --kimg /path/to/vmlinux --memory 512M --cpus 2 --script-exec ./run.sh
+mount: /dev/loop0 mounted on /tmp/tmp.trT0V4Kola/mnt.
+953562878
+1 key in keyring:
+953562878: --als--v     0     0 asymmetric: bpf-verity
+measure func=BPRM_CHECK template=ima-ngv2 digest_type=verity fsuuid=307da5e2-28d6-4cfb-b3da-3ad102df037c
+signing /tmp/tmp.trT0V4Kola/mnt/gatekeeper
+hash(sha256): eb8cc22dc8e55408291995c79d6bf921910e05ed1712cda92313b53189dbd58d
+evm/ima signature: 136 bytes
 Attached program to bpf(), ctrl-c to exit...
-```
-
-In a separate shell, execute some commands to check that things work as expected:
-
-```
-$ sudo bpftool prog list
-Error: can't get next program: Operation not permitted
-$ sudo ./tcprtt
-2023/04/18 10:56:14 Src addr        Port   -> Dest addr       Port   RTT
-```
-
-The LSM program has some debug logging which you can follow via the trace_pipe:
-
-```sh
-$ sudo cat /sys/kernel/debug/tracing/trace_pipe
-      bpf-verity-35254   [015] d..21  5792.699707: bpf_trace_printk: granting access
-           <...>-35285   [002] d..21  5795.031177: bpf_trace_printk: no verity information
-           <...>-35285   [002] d..21  5795.031312: bpf_trace_printk: no verity information
-           <...>-35285   [002] d..21  5795.031314: bpf_trace_printk: no verity information
-           <...>-35285   [002] d..21  5795.031315: bpf_trace_printk: no verity information
-           <...>-35285   [002] d..21  5795.031330: bpf_trace_printk: no verity information
-           <...>-35300   [006] d..21  5807.620858: bpf_trace_printk: granting access
-           <...>-35300   [006] d..21  5807.620897: bpf_trace_printk: granting access
-           <...>-35300   [006] d..21  5807.620906: bpf_trace_printk: granting access
-           <...>-35300   [006] d..21  5807.620971: bpf_trace_printk: granting access
-           <...>-35306   [002] d..21  5807.621338: bpf_trace_printk: granting access
-           <...>-35306   [002] d..21  5807.621349: bpf_trace_printk: granting access
-           <...>-35306   [002] d..21  5807.621406: bpf_trace_printk: granting access
-           <...>-35306   [002] d..21  5807.624551: bpf_trace_printk: granting access
-           <...>-35307   [006] d..21  5807.726222: bpf_trace_printk: granting access
-           <...>-35303   [005] d..21  5807.797234: bpf_trace_printk: granting access
-           <...>-35303   [005] d..21  5807.797565: bpf_trace_printk: granting access
-           <...>-35303   [005] d..21  5807.798990: bpf_trace_printk: granting access
+           <...>-186     [001] ...11     3.072183: bpf_trace_printk: granting access
+           <...>-189     [001] ...11     3.886923: bpf_trace_printk: denying access: 4
+      create-map-189     [001] ...11     3.887112: bpf_trace_printk: denying access: 4
+      create-map-189     [001] ...11     3.887118: bpf_trace_printk: denying access: 4
+Error: creating map: map create: operation not permitted (MEMLOCK may be too low, consider rlimit.RemoveMemlock)
+signing /tmp/tmp.trT0V4Kola/mnt/create-map
+hash(sha256): 06ffcd0bd9a43895ac2b8c689738d992783fe15c8ba78bd6b018f74a769b4a23
+evm/ima signature: 136 bytes
+      create-map-198     [000] ...11     3.916500: bpf_trace_printk: granting access
+      create-map-198     [000] ...11     3.916672: bpf_trace_printk: granting access
+      create-map-198     [000] ...11     3.916730: bpf_trace_printk: granting access
+      create-map-198     [000] ...11     3.916795: bpf_trace_printk: granting access
+      create-map-198     [000] ...11     3.916854: bpf_trace_printk: granting access
+created map
 ```
 
 [fs-verity]: https://www.kernel.org/doc/html/latest/filesystems/fsverity.html
+[IMA]: https://sourceforge.net/p/linux-ima/wiki/Home/
 [lsm]: https://docs.kernel.org/bpf/prog_lsm.html
