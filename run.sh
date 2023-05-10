@@ -34,62 +34,77 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Create a temporary file system so that we can restrict the IMA rule by fsuuid.
-# Also allows running the script in virtme which uses 9pfs (which doesn't support
-# fs-verity.)
-dd if=/dev/zero of="$img" bs=20M count=1 &> /dev/null
-mkfs -t ext4 -q "$img" -O verity
-mkdir "$mnt" && mount -v -o loop "$img" "$mnt"
+setup() {
+	# Create a temporary file system so that we can restrict the IMA rule by fsuuid.
+	# Also allows running the script in virtme which uses 9pfs (which doesn't support
+	# fs-verity.)
+	dd if=/dev/zero of="$img" bs=20M count=1 &> /dev/null
+	mkfs -t ext4 -q "$img" -O verity
+	mkdir "$mnt" && mount -v -o loop "$img" "$mnt"
 
-# create local _ima keyring and add our public key
-# On production systems the kernel uses .ima instead, but this can be locked
-# down. Not great for a demo.
-keyring="$(keyctl newring _ima @u)"
-readonly keyring
+	cp ./*.der "$mnt"
 
-keyctl padd asymmetric "bpf-verity" "$keyring" < cert.der
-keyctl list "$keyring"
+	# create local _ima keyring and add our public key
+	# On production systems the kernel uses .ima instead, but this can be locked
+	# down. Not great for a demo.
+	keyring="$(keyctl newring _ima @u)"
+	readonly keyring
 
-# Tail dmesg so that IMA messages appear in the output
-dmesg -C
-dmesg --follow &
+	keyctl padd asymmetric "bpf-verity" "$keyring" < cert.der
+	keyctl list "$keyring"
 
-# Copy binaries to the temporary filesystem and enable fsverity on them
-for bin in gatekeeper create-map; do
-	cp "$bin" "$mnt/"
-	# enable fsverity
-	fsverity enable --block-size 1024 "$mnt/$bin"
-done
+	# Tail dmesg so that IMA messages appear in the output
+	dmesg -C
+	dmesg --follow &
 
-# Measure any file that is being executed and force verity type digests
-uuid="$(blkid -s UUID -o value "$img")"
-readonly uuid
+	# Copy binaries to the temporary filesystem and enable fsverity on them
+	for bin in gatekeeper create-map; do
+		cp "$bin" "$mnt/"
+		# enable fsverity
+		fsverity enable --block-size 1024 "$mnt/$bin"
+	done
 
-if ! mount | grep -q /sys/kernel/security; then
-	mount -t securityfs securityfs /sys/kernel/security
-fi
+	# Measure any file that is being executed and force verity type digests
+	uuid="$(blkid -s UUID -o value "$img")"
+	readonly uuid
 
-add_ima_rule "measure func=BPRM_CHECK template=ima-ngv2 digest_type=verity fsuuid=$uuid"
+	if ! mount | grep -q /sys/kernel/security; then
+		mount -t securityfs securityfs /sys/kernel/security
+	fi
 
-# Get some debug info going
-cat /sys/kernel/debug/tracing/trace_pipe &
+	add_ima_rule "measure func=BPRM_CHECK template=ima-ngv2 digest_type=verity fsuuid=$uuid"
 
-# Run the gatekeeper
-ima_sign "$mnt/gatekeeper"
-"$mnt/gatekeeper" &
-sleep 1
+	# Get some debug info going
+	cat /sys/kernel/debug/tracing/trace_pipe &
+}
 
-# Execute without signing. This should fail.
-if "$mnt/create-map"; then
-	echo "Unexpectedly able to execute bpf() from unsigned binary"
-	exit 1
-elif ! [ $? -eq 42 ]; then
-	echo "bpf() returned an error different than EPERM"
-	exit 1
-fi
+run_gatekeeper() {
+	# Run the gatekeeper
+	ima_sign "$mnt/gatekeeper"
+	"$mnt/gatekeeper" &
+}
 
-ima_sign "$mnt/create-map"
-if ! "$mnt/create-map"; then
-	echo "Wasn't able to execute bpf() from signed program"
-	exit 1
+setup
+
+if [ "$0" = "$BASH_SOURCE" ]; then
+	run_gatekeeper
+	sleep 1
+
+	# Execute without signing. This should fail.
+	if "$mnt/create-map"; then
+		echo "Unexpectedly able to execute bpf() from unsigned binary"
+		exit 1
+	elif ! [ $? -eq 42 ]; then
+		echo "bpf() returned an error different than EPERM"
+		exit 1
+	fi
+
+	ima_sign "$mnt/create-map"
+	if ! "$mnt/create-map"; then
+		echo "Wasn't able to execute bpf() from signed program"
+		exit 1
+	fi
+else
+	set +euo pipefail
+	cd "$mnt"
 fi
